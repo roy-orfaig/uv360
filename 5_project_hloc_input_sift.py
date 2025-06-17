@@ -5,6 +5,8 @@ import struct
 import matplotlib.pyplot as plt
 import cv2
 import datetime
+from PIL import Image
+import plotly.graph_objects as go
 
 class UV360:
     def __init__(self, hloc_folder):
@@ -12,11 +14,89 @@ class UV360:
         self.images_txt_path = os.path.join(hloc_folder, "colomap_whole_scene_txt/images.txt")
         self.cameras_txt_path = os.path.join(hloc_folder, "colomap_whole_scene_txt/cameras.txt")
         self.point_cloud_path = os.path.join(hloc_folder, "colomap_whole_scene_txt/points3D.bin")
+        self.depth_path = os.path.join(hloc_folder,"depth_marigold")
         self.images_path = os.path.join(hloc_folder, "colors")
         self.camera_params = self._read_cameras_txt()
         self.data = self._read_images_txt()
         self.points3D = self.read_points3D_bin()
+        self.points3D_RGB = self.read_points3D_bin_rgb()
 
+    def read_points3D_bin_rgb(self):
+        """
+        Read a COLMAP points3D.bin file.
+        Returns a dict: point3D_id -> {
+        'xyz': (x,y,z),
+        'rgb': (r,g,b),
+        'error': float,
+        'track': [(image_id, point2d_idx), ...]
+        }
+        """
+        path=self.point_cloud_path
+        points = {}
+        with open(path, "rb") as f:
+            # number of points
+            num_points = struct.unpack("<Q", f.read(8))[0]
+            for _ in range(num_points):
+                pid = struct.unpack("<Q", f.read(8))[0]
+                xyz = struct.unpack("<ddd", f.read(24))
+                rgb = struct.unpack("BBB", f.read(3))
+                error = struct.unpack("<d", f.read(8))[0]
+                track_len = struct.unpack("<Q", f.read(8))[0]
+                track = []
+                for _ in range(track_len):
+                    img_id = struct.unpack("<I", f.read(4))[0]
+                    pt2d_idx = struct.unpack("<I", f.read(4))[0]
+                    track.append((img_id, pt2d_idx))
+                points[pid] = {
+                    'xyz': xyz,
+                    'rgb': rgb,
+                    'error': error,
+                    'track': track
+                }
+        return points
+        
+    
+    def _undistort_points_radial(self, xn, yn, k1):
+        r2 = xn ** 2 + yn ** 2
+        factor = 1 + k1 * r2
+        x_undist = xn / factor
+        y_undist = yn / factor
+        return x_undist, y_undist
+
+    def create_3D_point_cloud(self, image_id, depth_map):
+        if image_id not in self.data:
+            raise ValueError(f"Image ID {image_id} not found.")
+
+        cam_params = self.data[image_id]['camera']
+        fx = cam_params['fx']
+        fy = cam_params['fy']
+        cx = cam_params['cx']
+        cy = cam_params['cy']
+        k1 = cam_params['k']
+
+        h, w = depth_map.shape
+        x, y = np.meshgrid(np.arange(w), np.arange(h))
+
+        x_norm = (x - cx) / fx
+        y_norm = (y - cy) / fy
+        x_undist, y_undist = self._undistort_points_radial(x_norm, y_norm, k1)
+
+        X = x_undist * depth_map
+        Y = y_undist * depth_map
+        Z = depth_map
+        
+        u = x.reshape(-1)
+        v = y.reshape(-1)
+        X = X.reshape(-1)
+        Y = Y.reshape(-1)
+        Z = Z.reshape(-1)
+
+        # Final array: [u, v, X, Y, Z]
+        u_v_X_Y_Z = np.stack((u, v, X, Y, Z), axis=1)
+
+        points_3D_depth = np.stack((X, Y, Z), axis=-1).reshape(-1, 3)
+        return points_3D_depth,u_v_X_Y_Z
+    
     def _read_cameras_txt(self):
         camera_params = {}
         with open(self.cameras_txt_path, 'r') as f:
@@ -137,6 +217,128 @@ class UV360:
         
         return img_overlay
     
+    def save_html(self,save_file_path,point_cloud_3D):
+        hloc_pts = self.points3D_RGB
+        pointssfm = np.array([
+            [*pt['xyz'], *pt['rgb']]
+            for pt in hloc_pts.values()
+        ], dtype=float)
+
+        X=pointssfm[:,0].tolist()
+        Y=pointssfm[:,1].tolist()
+        Z=pointssfm[:,2].tolist()
+        R=pointssfm[:,3].tolist()
+        G=pointssfm[:,4].tolist()
+        B=pointssfm[:,5].tolist()
+
+
+        pc=point_cloud_3D.T
+        dataf = []
+        x=pc[0].tolist()
+        y=pc[1].tolist()
+        z=pc[2].tolist()
+        x=x[::10]
+        y=y[::10]
+        z=z[::10]
+        prjocted_pts = np.stack([x, y, z], axis=-1)
+        
+        point_size = np.full(len(x), 2)
+        # fig = px.scatter_3d(x=x ,y=y, z=z, size=point_size, size_max=1,opacity=1)
+        # dataf = [go.Scatter3d(x=x, y=y, z=z, mode="markers", marker=dict(size=1,color=z,colorscale='Viridis'))]
+        # #the global hloc reconstruction
+        #     go.Scatter3d(
+        #        x=hloc_pts[:, 0], y=hloc_pts[:, 1], z=hloc_pts[:, 2],
+        #        mode="markers",
+        #        marker=dict(size=1, color="lightgray", opacity=0.6),
+        #        name="hloc points3D.bin"
+        #  )
+        rgb_colors = np.stack([R, G, B], axis=1)
+        rgb_strings = ["rgb({},{},{})".format(int(r), int(g), int(b)) for r, g, b in rgb_colors]
+        dataf = [
+        # local point cloud (colored by z)
+        go.Scatter3d(
+            x=x, y=y, z=z,
+            mode="markers",
+            marker=dict(size=1, color=z, colorscale='Viridis'),
+            name="Local point cloud"
+        ),
+        # global hloc point cloud (gray)
+        go.Scatter3d(
+            x=X, y=Y, z=Z,
+            mode="markers",
+            marker=dict(size=1, color=rgb_strings, opacity=0.8),
+            name="Global HLOC"
+        ),
+        # # colored HLOC points
+        # go.Scatter3d(
+        #     x=xx, y=yy, z=zz,
+        #     mode="markers",
+        #     marker=dict(size=1, color=rgb_strings, opacity=0.8),
+        #     name="HLOC Colored"
+        # )
+    ]
+
+        rgb_colors = np.stack([R, G, B], axis=1) / 255.0  # normalize to [0, 1]
+
+        # Convert to 'rgb(r,g,b)' strings for Plotly
+        rgb_strings = ["rgb({:.0f},{:.0f},{:.0f})".format(r*255, g*255, b*255) for r, g, b in rgb_colors]
+
+        #Add HLOC point cloud
+        # dataf.append(go.Scatter3d(
+        #     x=xx, y=yy, z=zz,
+        #     mode="markers",
+        #     marker=dict(size=1, color=rgb_strings, opacity=0.8),
+        #     name="HLOC points3D.bin"
+        # ))
+        mega_centroid = np.average(pc, axis=1)
+        lower_bound = [-10, -10, -10]
+        upper_bound =  [10, 10, 10]
+
+        show_grid_lines=True
+        # Setup layout
+        grid_lines_color = 'rgb(127, 127, 127)' if show_grid_lines else 'rgb(30, 30, 30)'
+        layout = go.Layout(scene=dict(
+                xaxis=dict(nticks=8,
+                        range=[lower_bound[0], upper_bound[0]],
+                        showbackground=True,
+                        backgroundcolor='rgb(30, 30, 30)',
+                        gridcolor=grid_lines_color,
+                        zerolinecolor=grid_lines_color),
+                yaxis=dict(nticks=8,
+                        range=[lower_bound[1], upper_bound[1]],
+                        showbackground=True,
+                        backgroundcolor='rgb(30, 30, 30)',
+                        gridcolor=grid_lines_color,
+                        zerolinecolor=grid_lines_color),
+                zaxis=dict(nticks=8,
+                        range=[lower_bound[2], upper_bound[2]],
+                        showbackground=True,
+                        backgroundcolor='rgb(30, 30, 30)',
+                        gridcolor=grid_lines_color,
+                        zerolinecolor=grid_lines_color),
+                xaxis_title="x (meters)",
+                yaxis_title="y (meters)",
+                zaxis_title="z (meters)"
+            ),
+            margin=dict(r=10, l=10, b=10, t=10),
+            paper_bgcolor='rgb(30, 30, 30)',
+            font=dict(
+                family="Courier New, monospace",
+                color=grid_lines_color
+            ),
+            legend=dict(
+                font=dict(
+                    family="Courier New, monospace",
+                    color='rgb(127, 127, 127)'
+                )
+            )
+        )
+
+        fig = go.Figure(data=dataf,layout=layout)
+        fig.show()
+        fig.write_html(save_file_path, auto_open=True)
+        
+    
     def extarct_sift_matches(self, image_id):
         points2d = self.data[image_id]["POINTS2D"]  # shape: (N, 3)
         valid_mask = points2d[:, 2] > 0  # third column is POINT3D_ID
@@ -144,6 +346,60 @@ class UV360:
         sift_match_pixels = points2d[valid_mask, :2]  # (x, y)
         sift_match_3D_ids = points2d[valid_mask, 2] 
         return sift_match_pixels, sift_match_3D_ids
+    
+    def run_projection_from_depth_to_all(self, output_folder):
+        os.makedirs(output_folder, exist_ok=True)
+        for i, (image_id, image_data) in enumerate(self.data.items()):
+            rgb_path = os.path.join(self.images_path, image_data['file_name'])
+            file_name= os.path.splitext(image_data['file_name'])[0] + ".npy"
+            depth_image_path = os.path.join(self.depth_path, file_name)
+            if not os.path.exists(rgb_path):
+                print(f"Image not found: {rgb_path}")
+                continue
+            depth_map = np.load(depth_image_path)
+            file_name_html = os.path.splitext(image_data['file_name'])[0] + ".html"
+            point_cloud_3D,_ = self.create_3D_point_cloud(image_id, depth_map)
+            self.save_html(os.path.join(output_folder, file_name_html), point_cloud_3D)
+            print(f"Saved: {file_name_html}")
+            
+    def run_registration(self, output_folder):
+        os.makedirs(output_folder, exist_ok=True)
+        for i, (image_id, image_data) in enumerate(self.data.items()):
+            rgb_path = os.path.join(self.images_path, image_data['file_name'])
+            file_name= os.path.splitext(image_data['file_name'])[0] + ".npy"
+            depth_image_path = os.path.join(self.depth_path, file_name)
+            if not os.path.exists(rgb_path):
+                print(f"Image not found: {rgb_path}")
+                continue
+            depth_map = np.load(depth_image_path)
+            rgb = cv2.cvtColor(cv2.imread(rgb_path), cv2.COLOR_BGR2RGB)
+            sift_match_pixels,sift_match_3d= self.extarct_sift_matches(image_id)
+            
+            sift_match_3d = sift_match_3d.astype(int)
+
+            points3D_dict = self.points3D  # assume dict: {POINT3D_ID: [X, Y, Z]}
+
+            # Create a mask for valid 3D matches (i.e., ID exists in the dict)
+            N = len(points3D_dict)
+            valid_indices = [
+                idx for idx, pid in enumerate(sift_match_3d.astype(int))
+                if pid < N
+            ]
+            valid_pixels = sift_match_pixels[valid_indices]
+            valid_ids = sift_match_3d[valid_indices]
+
+            # Lookup 3D points
+            valid_points3D = points3D_dict[valid_ids.astype(int)] 
+
+            # Concatenate u,v,X,Y,Z
+            u_v_X_Y_Z_HLOC = np.hstack((valid_pixels, valid_points3D))
+            
+            point_cloud_3D,u_v_X_Y_Z_Marigold = self.create_3D_point_cloud(image_id, depth_map)
+            
+            file_name_html = os.path.splitext(image_data['file_name'])[0] + ".html"
+           
+            self.save_html(os.path.join(output_folder, file_name_html), point_cloud_3D)
+            print(f"Saved: {file_name_html}")
     
     def run_projection_for_all(self, output_folder):
         os.makedirs(output_folder, exist_ok=True)
@@ -229,5 +485,7 @@ if __name__ == "__main__":
 
     uv360 = UV360(hloc_folder)
     print(f"Loaded {len(uv360.data)} images")
-    uv360.run_projection_for_all(output_folder)
+    #uv360.run_projection_for_all(output_folder)
+    #uv360.run_projection_from_depth_to_all(output_folder)
+    uv360.run_registration(output_folder)
 
