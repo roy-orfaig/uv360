@@ -7,13 +7,16 @@ import cv2
 import datetime
 from PIL import Image
 import plotly.graph_objects as go
+import numpy as np
+from sklearn.linear_model import RANSACRegressor
+from sklearn.preprocessing import StandardScaler
 
 class UV360:
     def __init__(self, hloc_folder):
         self.hloc_folder = hloc_folder
-        self.images_txt_path = os.path.join(hloc_folder, "colomap_whole_scene_txt/images.txt")
-        self.cameras_txt_path = os.path.join(hloc_folder, "colomap_whole_scene_txt/cameras.txt")
-        self.point_cloud_path = os.path.join(hloc_folder, "colomap_whole_scene_txt/points3D.bin")
+        self.images_txt_path = os.path.join(hloc_folder, "colomap_good_scene/images.txt")
+        self.cameras_txt_path = os.path.join(hloc_folder, "colomap_good_scene/cameras.txt")
+        self.point_cloud_path = os.path.join(hloc_folder, "colomap_good_scene/points3D.bin")
         self.depth_path = os.path.join(hloc_folder,"depth_marigold")
         self.images_path = os.path.join(hloc_folder, "colors")
         self.camera_params = self._read_cameras_txt()
@@ -174,7 +177,7 @@ class UV360:
         pixels = np.vstack((u, v)).T
         return pixels, points_cam_in_camera
 
-    def project_points_to_image(self, image_id, points3D,rgb_img, flag=True):
+    def project_points_to_image(self, image_id, points3D,rgb_img, flag=False):
         
         if flag:
             sift_match_pixels,sift_match_3d= self.extarct_sift_matches(image_id)
@@ -223,13 +226,19 @@ class UV360:
             [*pt['xyz'], *pt['rgb']]
             for pt in hloc_pts.values()
         ], dtype=float)
-
-        X=pointssfm[:,0].tolist()
-        Y=pointssfm[:,1].tolist()
-        Z=pointssfm[:,2].tolist()
-        R=pointssfm[:,3].tolist()
-        G=pointssfm[:,4].tolist()
-        B=pointssfm[:,5].tolist()
+        if True:
+            valid_index=self.extract_valid_point3D_ids(self.images_txt_path)
+            filtered_valid_ids = [idx for idx in valid_index if idx < len(self.points3D_RGB)]
+            X, Y, Z = pointssfm[filtered_valid_ids, 0], pointssfm[filtered_valid_ids, 1], pointssfm[filtered_valid_ids, 2]
+            R, G, B = pointssfm[filtered_valid_ids, 3], pointssfm[filtered_valid_ids, 4], pointssfm[filtered_valid_ids, 5]
+        else:
+            X=pointssfm[:,0].tolist()
+            Y=pointssfm[:,1].tolist()
+            Z=pointssfm[:,2].tolist()
+            R=pointssfm[:,3].tolist()
+            G=pointssfm[:,4].tolist()
+            B=pointssfm[:,5].tolist()
+            
 
 
         pc=point_cloud_3D.T
@@ -335,8 +344,8 @@ class UV360:
         )
 
         fig = go.Figure(data=dataf,layout=layout)
-        fig.show()
-        fig.write_html(save_file_path, auto_open=True)
+        #fig.show()
+        fig.write_html(save_file_path, auto_open=False)
         
     
     def extarct_sift_matches(self, image_id):
@@ -359,9 +368,66 @@ class UV360:
             depth_map = np.load(depth_image_path)
             file_name_html = os.path.splitext(image_data['file_name'])[0] + ".html"
             point_cloud_3D,_ = self.create_3D_point_cloud(image_id, depth_map)
-            self.save_html(os.path.join(output_folder, file_name_html), point_cloud_3D)
-            print(f"Saved: {file_name_html}")
+            output_folder_depth=os.path.join(output_folder,"depth")
+            os.makedirs(output_folder_depth, exist_ok=True)
+            output_folder_depth_path=os.path.join(output_folder_depth, file_name_html)
+            self.save_html(output_folder_depth_path, point_cloud_3D)
+            print(f"Saved: {output_folder_depth_path}")
             
+    def find_affine_transform_from_uv_match(self,uvxyz_mari, uvxyz_hloc):
+        # Step 1: Create dictionary for fast lookup from (u, v) → index
+        hloc_dict = {(int(u), int(v)): [x, y, z] for u, v, x, y, z in uvxyz_hloc}
+        
+        # Step 2: Find common (u,v) pairs
+        common_uv = []
+        src_pts = []
+        dst_pts = []
+
+        for u, v, x, y, z in uvxyz_mari:
+            key = (int(u), int(v))
+            if key in hloc_dict:
+                common_uv.append([u, v])
+                src_pts.append([x, y, z])            # from Marigold
+                dst_pts.append(hloc_dict[key])       # from HLOC
+
+        if len(src_pts) < 3:
+            raise ValueError("Not enough correspondences for affine estimation")
+
+        src_pts = np.array(src_pts)
+        dst_pts = np.array(dst_pts)
+        common_uv = np.array(common_uv)
+
+        # Step 3: Estimate scale
+        scale_factor =1 # np.median(np.linalg.norm(dst_pts, axis=1) / (np.linalg.norm(src_pts, axis=1) + 1e-8))
+        src_pts_scaled = src_pts * scale_factor
+
+        affine_matrix = self.estimate_affine(src_pts_scaled, dst_pts)
+
+        # Step 5: Apply transformation to full Marigold
+        # all_src_xyz = uvxyz_mari[:, 2:5] * scale_factor
+        # all_src_xyz_h = np.hstack([all_src_xyz, np.ones((all_src_xyz.shape[0], 1))])
+        # transformed_xyz = (affine_matrix @ all_src_xyz_h.T).T[:, :3]
+        # uvxyz_mari_aligned = np.hstack([uvxyz_mari[:, :2], transformed_xyz])
+        
+        all_src_xyz = uvxyz_mari[:, 2:5] * scale_factor
+        all_src_xyz_h = np.hstack([all_src_xyz, np.ones((all_src_xyz.shape[0], 1))])
+        transformed_xyz = (affine_matrix @ all_src_xyz_h.T).T[:, :3]
+        uvxyz_mari_aligned = np.hstack([uvxyz_mari[:, :2], transformed_xyz])
+
+        return affine_matrix, uvxyz_mari_aligned
+        
+        
+    
+    def estimate_affine(self,src, dst):
+        N = src.shape[0]
+        src_h = np.hstack([src, np.ones((N, 1))])  # (N, 4)
+        A, _, _, _ = np.linalg.lstsq(src_h, dst, rcond=None)  # (4, 3)
+        affine = np.eye(4)
+        affine[:3, :] = A.T
+        return affine
+
+    
+    
     def run_registration(self, output_folder):
         os.makedirs(output_folder, exist_ok=True)
         for i, (image_id, image_data) in enumerate(self.data.items()):
@@ -396,10 +462,16 @@ class UV360:
             
             point_cloud_3D,u_v_X_Y_Z_Marigold = self.create_3D_point_cloud(image_id, depth_map)
             
+            affine, uvxyz_mari_aligned = self.find_affine_transform_from_uv_match(u_v_X_Y_Z_Marigold, u_v_X_Y_Z_HLOC)
+            
+            xyz_mari_aligned = uvxyz_mari_aligned[:, 2:5]
+            
             file_name_html = os.path.splitext(image_data['file_name'])[0] + ".html"
-           
-            self.save_html(os.path.join(output_folder, file_name_html), point_cloud_3D)
-            print(f"Saved: {file_name_html}")
+            output_folder_registration=os.path.join(output_folder,"Registration")
+            os.makedirs(output_folder_registration, exist_ok=True)
+            file_name_html_path=os.path.join(output_folder_registration, file_name_html)
+            self.save_html(file_name_html_path, xyz_mari_aligned)
+            print(f"Saved: {file_name_html_path}")
     
     def run_projection_for_all(self, output_folder):
         os.makedirs(output_folder, exist_ok=True)
@@ -410,7 +482,9 @@ class UV360:
                 continue
             rgb = cv2.cvtColor(cv2.imread(rgb_path), cv2.COLOR_BGR2RGB)
             overlay = self.project_points_to_image(image_id, self.points3D, rgb)
-            out_path = os.path.join(output_folder, image_data['file_name'])
+            output_folder_projection=os.path.join(output_folder,"projection")
+            os.makedirs(output_folder_projection, exist_ok=True)
+            out_path = os.path.join(output_folder_projection, image_data['file_name'])
             cv2.imwrite(out_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
             print(f"Saved: {out_path}")
 
@@ -465,7 +539,65 @@ class UV360:
             i += 1
 
         return data
+    def qvec2rotmat(self,qvec):
+        w, x, y, z = qvec
+        return np.array([
+            [1 - 2*y**2 - 2*z**2, 2*x*y - 2*z*w,     2*x*z + 2*y*w],
+            [2*x*y + 2*z*w,       1 - 2*x**2 - 2*z**2, 2*y*z - 2*x*w],
+            [2*x*z - 2*y*w,       2*y*z + 2*x*w,     1 - 2*x**2 - 2*y**2]
+        ])
+    
+    def read_camera_poses(self,path):
+        image_ids, cam_poses, image_names = [], [], []
+        with open(path, 'r') as f:
+            lines = f.readlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith("#") or not line:
+                i += 1
+                continue
+            elems = line.split()
+            image_id = int(elems[0])
+            qvec = np.array(list(map(float, elems[1:5])))
+            tvec = np.array(list(map(float, elems[5:8])))
+            image_name = elems[9]
+            R = self.qvec2rotmat(qvec)
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3] = tvec
+            cam_poses.append(np.linalg.inv(T))  # to camera-to-world
+            image_ids.append(image_id)
+            image_names.append(image_name)
+            i += 2  # skip next line
+        return image_ids, cam_poses, image_names
 
+    def add_camera_poses_to_figure(self,dataf, cam_poses_world, image_names):
+        for i, pose in enumerate(cam_poses_world):
+            cam_center = pose[:3, 3]
+            cam_forward = -pose[:3, 2]
+            end = cam_center + 0.5 * cam_forward
+            dataf.append(go.Scatter3d(
+                x=[cam_center[0]],
+                y=[cam_center[1]],
+                z=[cam_center[2]],
+                mode="markers+text",
+                marker=dict(size=4, color="red"),
+                text=[image_names[i]],
+                textposition="top center",
+                name="Camera center" if i == 0 else None,
+                showlegend=(i == 0)
+            ))
+            dataf.append(go.Scatter3d(
+                x=[cam_center[0], end[0]],
+                y=[cam_center[1], end[1]],
+                z=[cam_center[2], end[2]],
+                mode="lines",
+                line=dict(color="red", width=2),
+                showlegend=False
+            ))
+        return dataf
+    
     def _quaternion_to_rotation_matrix(self, qw, qx, qy, qz):
         norm = np.sqrt(qw**2 + qx**2 + qy**2 + qz**2)
         qw, qx, qy, qz = qw/norm, qx/norm, qy/norm, qz/norm
@@ -477,6 +609,113 @@ class UV360:
         ])
         return R
 
+    def extract_valid_point3D_ids(self,images_txt_path):
+        point3D_ids = set()
+
+        with open(images_txt_path, 'r') as f:
+            lines = f.readlines()
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith('#') or len(line) == 0:
+                i += 1
+                continue
+
+            # Skip first line of image block
+            i += 1
+            if i >= len(lines):
+                break
+
+            # Second line: 2D points with POINT3D_IDs
+            tokens = lines[i].strip().split()
+            for j in range(2, len(tokens), 3):
+                try:
+                    pid = int(tokens[j])
+                    if pid > -1:
+                        point3D_ids.add(pid)
+                except ValueError:
+                    continue  # In case of corrupted line
+
+            i += 1
+
+        return sorted(point3D_ids)
+
+    
+    
+    def show_hloc_and_camera_poses(self,output_folder):
+        hloc_data = self.points3D_RGB
+        pointssfm = np.array([[*pt['xyz'], *pt['rgb']] for pt in hloc_data.values()])
+        if True:
+            valid_index=self.extract_valid_point3D_ids(self.images_txt_path)
+            filtered_valid_ids = [idx for idx in valid_index if idx < len(hloc_data)]
+            xx, yy, zz = pointssfm[filtered_valid_ids, 0], pointssfm[filtered_valid_ids, 1], pointssfm[filtered_valid_ids, 2]
+            R, G, B = pointssfm[filtered_valid_ids, 3], pointssfm[filtered_valid_ids, 4], pointssfm[filtered_valid_ids, 5]
+        else:
+            xx, yy, zz = pointssfm[:, 0], pointssfm[:, 1], pointssfm[:, 2]
+            R, G, B = pointssfm[:, 3], pointssfm[:, 4], pointssfm[:, 5]  
+        rgb_strings = ["rgb({},{},{})".format(int(r), int(g), int(b)) for r, g, b in np.stack([R, G, B], axis=1)]
+
+        # ====== Plot Scene ======
+
+        dataf = [
+            go.Scatter3d(x=xx, y=yy, z=zz, mode="markers", marker=dict(size=1, color=rgb_strings, opacity=0.8), name="HLOC Colored"),
+        ]
+
+        _, cam_poses_world, image_names = self.read_camera_poses(self.images_txt_path)
+        dataf = self.add_camera_poses_to_figure(dataf, cam_poses_world, image_names)
+
+        lower_bound = [-10, -10, -10]
+        upper_bound =  [10, 10, 10]
+
+        show_grid_lines=True
+        # Setup layout
+        grid_lines_color = 'rgb(127, 127, 127)' if show_grid_lines else 'rgb(30, 30, 30)'
+        layout = go.Layout(scene=dict(
+                xaxis=dict(nticks=10,
+                        range=[lower_bound[0], upper_bound[0]],   
+                        showbackground=True,
+                        backgroundcolor='rgb(30, 30, 30)',
+                        gridcolor=grid_lines_color,
+                        zerolinecolor=grid_lines_color),
+                yaxis=dict(nticks=10,
+                        range=[lower_bound[0], upper_bound[0]],
+                        showbackground=True,
+                        backgroundcolor='rgb(30, 30, 30)',
+                        gridcolor=grid_lines_color,
+                        zerolinecolor=grid_lines_color),
+                zaxis=dict(nticks=10,
+                        range=[lower_bound[0], upper_bound[0]],
+                        showbackground=True,
+                        backgroundcolor='rgb(30, 30, 30)',
+                        gridcolor=grid_lines_color,
+                        zerolinecolor=grid_lines_color),
+                xaxis_title="x (meters)",
+                yaxis_title="y (meters)",
+                zaxis_title="z (meters)"
+            ),
+            margin=dict(r=10, l=10, b=10, t=10),
+            paper_bgcolor='rgb(30, 30, 30)',
+            font=dict(
+                family="Courier New, monospace",
+                color=grid_lines_color
+            ),
+            legend=dict(
+                font=dict(
+                    family="Courier New, monospace",
+                    color='rgb(127, 127, 127)'
+                )
+            )
+        )
+            
+        fig = go.Figure(data=dataf, layout=layout)
+        html_file = os.path.join(output_folder, "hloc_camera_poses.html")
+        if not os.path.exists(output_folder):
+            os.makedirs(output_folder)
+        print(f"Saving HTML to {html_file}")
+        fig.write_html(html_file,auto_open=False)
+
+
 if __name__ == "__main__":
     hloc_folder = "/home/roy.o@uveye.local/projects/uv360/uveye_input/1b84c86e-4698-42d2-8974-59700df741d2/front"
     # image_folder = os.path.join(hloc_folder, "../colors")
@@ -485,7 +724,9 @@ if __name__ == "__main__":
 
     uv360 = UV360(hloc_folder)
     print(f"Loaded {len(uv360.data)} images")
-    #uv360.run_projection_for_all(output_folder)
-    #uv360.run_projection_from_depth_to_all(output_folder)
+    uv360.show_hloc_and_camera_poses(output_folder)
+    uv360.run_projection_for_all(output_folder)
+    uv360.run_projection_from_depth_to_all(output_folder)
     uv360.run_registration(output_folder)
+    
 
