@@ -1116,6 +1116,30 @@ class UV360:
 
         return np.stack((x, y, Z), axis=-1)
 
+    def save_as_ply_with_color(self,filename, xyz_rgb):
+        
+        """
+        Save Nx6 numpy array to PLY file (ASCII) with RGB color for use in MeshLab.
+        Each row in xyz_rgb should be [x, y, z, r, g, b] with RGB in 0–255.
+        """
+        N = xyz_rgb.shape[0]
+        header = f"""ply
+        format ascii 1.0
+        element vertex {N}
+        property float x
+        property float y
+        property float z
+        property uchar red
+        property uchar green
+        property uchar blue
+        end_header
+        """
+
+        with open(filename, 'w') as f:
+            f.write(header)
+            for row in xyz_rgb:
+                x, y, z, r, g, b = row
+                f.write(f"{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n")
     
     def reconstruct_from_2D_to_3D(self,output_folder):
         os.makedirs(output_folder, exist_ok=True)
@@ -1131,14 +1155,28 @@ class UV360:
             sift_match_pixels,sift_match_3d= self.extarct_sift_matches(image_id)
             
             sift_match_3d = sift_match_3d.astype(int)
-            rgb[0]
             points3D_dict = self.points3D  # assume dict: {POINT3D_ID: [X, Y, Z]}
-            ref_rgb = rgb[0]
-            lower_bound = np.clip(ref_rgb - 5, 0, 255)
-            upper_bound = np.clip(ref_rgb + 5, 0, 255)
-            mask = np.all((rgb >= lower_bound) & (rgb <= upper_bound), axis=2)
-            filtered_rgb_pixels = rgb[mask]
-            mask_background = np.all((rgb >= lower_bound) & (rgb <= upper_bound), axis=2)
+            ref_rgb = [236, 237, 239]
+            lower_bound = np.clip(ref_rgb , 0, 255)
+            upper_bound = np.clip(ref_rgb , 0, 255)
+            mask_raw = np.all((rgb >= lower_bound) & (rgb <= upper_bound), axis=2)
+            
+# Assume mask_raw is a boolean mask
+            mask_uint8 = (mask_raw.astype(np.uint8)) * 255
+
+            # Morphological closing
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mask_closed = cv2.morphologyEx(~mask_uint8, cv2.MORPH_CLOSE, kernel_close)
+
+            # Erosion
+            kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+            mask_eroded = cv2.erode(mask_closed, kernel_erode, iterations=1)
+            mask_background = (~mask_eroded > 0)          
+            
+            
+            
+            # filtered_rgb_pixels = rgb[mask]
+            # mask_background = np.all((rgb >= lower_bound) & (rgb <= upper_bound), axis=2)
             
             # Create a mask for valid 3D matches (i.e., ID exists in the dict)
             N = len(points3D_dict)
@@ -1204,6 +1242,19 @@ class UV360:
             xyz_array = self.backproject_pixels_to_3d_batch(u_flat, v_flat, K, dist_coeffs, img_z)
            
             rgb_color=rgb[~mask_background] 
+            
+            
+            xyz_rgb=np.concatenate([xyz_array,rgb_color], axis=1)
+            file_name_ply = os.path.splitext(image_data['file_name'])[0] + ".ply"
+            output_folder_ply=os.path.join(output_folder,"xyz_rgb")
+            os.makedirs(output_folder_ply, exist_ok=True)
+            file_name_ply_path=os.path.join(output_folder_ply, file_name_ply)
+            if not os.path.exists(output_folder_ply):
+                os.makedirs(output_folder)
+            self.save_as_ply_with_color(file_name_ply_path, xyz_rgb)
+            
+            
+            
             rgb_normalized = rgb_color / 255.0
             rgb_hex = [mcolors.to_hex(rgb) for rgb in rgb_normalized]
             dataf = [
@@ -1535,7 +1586,7 @@ if __name__ == "__main__":
         # uv360.run_projection_for_all(output_folder)
         # uv360.run_projection_from_depth_to_all(output_folder)
         # uv360.run_registration(output_folder)
-        uv360.reconstruct_from_2D_to_3D(output_folder)
+        # uv360.reconstruct_from_2D_to_3D(output_folder)
         # uv360.calc_depth_plot(output_folder)
-    
+        uv360.projects_pair_3D(output_folder)
 
