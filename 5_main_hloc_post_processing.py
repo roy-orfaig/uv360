@@ -30,28 +30,6 @@ def rotate_around_y(xyz, angle_degrees):
     ])
     return (R_y @ xyz.T).T
 
-def extract_yaw_pitch_roll_real_world(R):
-    """
-    Extract yaw (Z), pitch (Y), and roll (X) in degrees from a 3x3 rotation matrix,
-    in real-world frame where:
-      X = forward
-      Y = left/right
-      Z = up
-
-    Rotation order: yaw(Z) → pitch(Y) → roll(X)
-    """
-    if abs(R[2, 0]) < 1.0:  # avoid gimbal lock
-        pitch = np.arcsin(-R[2, 0])
-        yaw   = np.arctan2(R[1, 0], R[0, 0])
-        roll  = np.arctan2(R[2, 1], R[2, 2])
-    else:
-        # Gimbal lock
-        pitch = np.pi / 2 if R[2, 0] <= -1 else -np.pi / 2
-        yaw   = np.arctan2(-R[0, 1], R[1, 1])
-        roll  = 0
-
-    return np.degrees([yaw, pitch, roll])
-
 def extract_yaw_pitch_roll_custom(R):
     """
     Extract yaw (around Y), pitch (around X), and roll (around Z)
@@ -116,25 +94,6 @@ def rotate_inverse_yaw_pitch_roll(xyz, yaw_deg, pitch_deg, roll_deg):
 
     # Apply rotation to point cloud
     return (R @ xyz.T).T
-
-def convert_extrinsic_camera_to_real_world(extrinsic_cam_to_world):
-    """
-    Given a 4x4 extrinsic matrix (camera-to-world in camera axes),
-    return the equivalent 4x4 extrinsic matrix in real-world convention
-    (X=forward, Y=left, Z=up).
-    """
-    # Rotation to align axes
-    R = np.array([
-        [0, 0, 1],  # forward (X_real) = Z_cam
-        [1, 0, 0],  # left    (Y_real) = X_cam
-        [0, 1, 0]   # up      (Z_real) = Y_cam
-    ])
-    R_align = np.eye(4)
-    R_align[:3, :3] = R
-
-    # Final transformation
-    extrinsic_real_world = R_align @ extrinsic_cam_to_world
-    return extrinsic_real_world
 
 class PreProcessing:
     def __init__(self, input_dir):
@@ -248,18 +207,6 @@ class UV360:
         # Transform point cloud: world to camera coordinates
         aligned_points = (points @ R_cw.T) + t_cw
         return aligned_points ,R_cw , t_cw
-    
-    def transform_camera_to_world3D(xyz):
-        """
-        Transform a point cloud from camera convention (X=lateral, Y=up, Z=forward)
-        to real-world 3D (X=forward, Y=left/right, Z=up)
-        """
-        R = np.array([
-            [0, 0, 1],  # X_world = Z_camera
-            [1, 0, 0],  # Y_world = X_camera
-            [0, 1, 0]   # Z_world = Y_camera
-        ])
-        return (R @ xyz.T).T
     
     def plot_point_clouds(self,original, aligned, T, output_path):
         
@@ -1569,45 +1516,6 @@ class UV360:
 
         return pc0, R, t    
     
-    def rotate_inverse_yaw_pitch_roll_real_world(self,xyz, yaw_deg, pitch_deg, roll_deg):
-        """
-        Apply inverse yaw, pitch, roll rotation to a point cloud in real-world coordinates:
-        X = forward, Y = left/right, Z = up
-        Rotation order: yaw(Z) → pitch(Y) → roll(X)
-        Inverse applied: roll⁻¹(X) → pitch⁻¹(Y) → yaw⁻¹(Z) = Rz @ Ry @ Rx
-        """
-        # Convert degrees to radians and negate to invert
-        yaw   = np.radians(-yaw_deg)   # around Z
-        pitch = np.radians(-pitch_deg) # around Y
-        roll  = np.radians(-roll_deg)  # around X
-
-        # Inverse Roll: X-axis
-        Rx = np.array([
-            [1, 0,            0           ],
-            [0, np.cos(roll), -np.sin(roll)],
-            [0, np.sin(roll),  np.cos(roll)]
-        ])
-
-        # Inverse Pitch: Y-axis
-        Ry = np.array([
-            [ np.cos(pitch), 0, np.sin(pitch)],
-            [ 0,             1, 0           ],
-            [-np.sin(pitch), 0, np.cos(pitch)]
-        ])
-
-        # Inverse Yaw: Z-axis
-        Rz = np.array([
-            [np.cos(yaw), -np.sin(yaw), 0],
-            [np.sin(yaw),  np.cos(yaw), 0],
-            [0,            0,           1]
-        ])
-
-        # Combined inverse rotation: R = Rz @ Ry @ Rx
-        R = Rz @ Ry @ Rx
-
-        # Apply to point cloud
-        return (R @ xyz.T).T
-    
     def projects_pair_3D_svd(self, output_folder):
         
         ply_files = sorted(glob(os.path.join(self.xyz_rgb_path, "*.ply")))
@@ -1626,12 +1534,6 @@ class UV360:
             data0 = self.data[i0]
             data1 = self.data[i1]
 
-            R_world = np.array([
-                [0, 0, 1],  # X_real = Z_cam
-                [1, 0, 0],  # Y_real = X_cam
-                [0, 1, 0]   # Z_real = Y_cam
-            ])
-        
             # Load .ply files
             name0 = os.path.join(self.xyz_rgb_path, os.path.splitext(data0['file_name'])[0] + ".ply")
             mesh0 = trimesh.load(name0)
@@ -1639,17 +1541,13 @@ class UV360:
             R_SVD0=data0["R_SVD"]
             T_SVD0=data0["T_SVD"]
             ex0=data0["extrinsic"]
-            ex0_world=convert_extrinsic_camera_to_real_world(ex0)
             xyz0=data0["sift_XYZ"]
-            xyz0_world=(R_world @ xyz0.T).T
-            
             sift_match_pixels, sift_match_3D_ids=self.extarct_sift_matches(i0)
-            #yaw0, pitch0, roll0 = extract_yaw_pitch_roll_real_world(ex0_world)
-            yaw0, pitch0, roll0  = extract_yaw_pitch_roll_custom(ex0)
+            yaw0, pitch, roll = extract_yaw_pitch_roll_custom(ex0)
             print("EX0:")
-            print("Pitch:", pitch0)
+            print("Pitch:", pitch)
             print("Yaw:", yaw0)
-            print("Roll:", roll0)
+            print("Roll:", roll)
 
             name1 = os.path.join(self.xyz_rgb_path, os.path.splitext(data1['file_name'])[0] + ".ply")
             mesh1 = trimesh.load(name1)
@@ -1657,21 +1555,15 @@ class UV360:
             R_SVD1=data1["R_SVD"]
             T_SVD1=data1["T_SVD"]
             xyz1=data1["sift_XYZ"]
-            xyz1_world=(R_world @ xyz1.T).T
             ex1=data1["extrinsic"]
-            # ex1_world=convert_extrinsic_camera_to_real_world(ex1)
-            # yaw1, pitch1, roll1 = extract_yaw_pitch_roll_real_world(ex1_world)
-            yaw1, pitch1, roll1 = extract_yaw_pitch_roll_custom(ex1)
+            yaw1, pitch, roll = extract_yaw_pitch_roll_custom(ex1)
             print("EX1:")
-            print("Pitch:", pitch1)
+            print("Pitch:", pitch)
             print("Yaw:", yaw1)
-            print("Roll:", roll1)
+            print("Roll:", roll)
              
             aligned0 = xyz0 - xyz0.mean(axis=0)
             aligned1 = xyz1 - xyz1.mean(axis=0)
-            
-            aligned0_world = xyz0_world - xyz0_world.mean(axis=0)
-            aligned1_world = xyz1_world - xyz1_world.mean(axis=0)
             
             
             aligned0_icp, R, t = self.run_icp_numpy(aligned0, aligned1)
@@ -1697,9 +1589,6 @@ class UV360:
             xyz1_flipped = xyz1.copy()
             xyz1_flipped[:, 0] *= -1
             xyz1_flipped_icp, R, t = self.run_icp_numpy(xyz1_flipped, xyz0)
-           # aligned0_rot = self.rotate_inverse_yaw_pitch_roll_real_world(aligned0_world, -yaw0,0,0)  
-           # aligned1_rot = self.rotate_inverse_yaw_pitch_roll_real_world(aligned1_world, -yaw1,0,0)  
-            
             aligned0_rot = rotate_inverse_yaw(aligned0, -yaw0)  
             aligned1_rot = rotate_inverse_yaw(aligned1, -yaw1)  
             # points1_align = (R_yaw @ (aligned1.T)).T
