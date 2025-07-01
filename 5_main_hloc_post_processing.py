@@ -21,6 +21,26 @@ import os
 from glob import glob
 from scipy.spatial.transform import Rotation as RR
 
+def compute_yaw_from_pointcloud(xyz):
+    """
+    Estimate yaw angle (in degrees) from point cloud (Z=depth, X=left-right),
+    using SVD on the X-Z plane.
+    """
+    # Extract X and Z (discard Y=height)
+    xz = xyz[:, [0, 2]]
+
+    # Center the points
+    xz_centered = xz - xz.mean(axis=0)
+
+    # SVD to find dominant direction
+    U, S, Vt = np.linalg.svd(xz_centered)
+    direction = Vt[0]  # principal axis
+
+    # Angle between principal direction and Z-axis [0,1]
+    yaw_rad = np.arctan2(direction[0], direction[1])  # atan2(x, z)
+
+    return np.degrees(yaw_rad)
+
 def rotate_around_y(xyz, angle_degrees):
     angle_rad = np.radians(angle_degrees)
     R_y = np.array([
@@ -57,6 +77,37 @@ def rotate_inverse_yaw(xyz, yaw_degrees):
         [-np.sin(angle_rad), 0, np.cos(angle_rad)]
     ])
     return (R_y @ xyz.T).T
+
+def rotate_inverse_yaw_RGB(pc_rgb, yaw_degrees):
+    """
+    Rotate only the XYZ part of a point cloud (with RGB) by inverse yaw (around Y axis).
+    
+    Parameters:
+        pc_rgb: (N, 6) array of [X Y Z R G B]
+        yaw_degrees: angle in degrees (positive = left, negative = right)
+
+    Returns:
+        rotated_pc_rgb: (N, 6) with rotated XYZ, original RGB
+    """
+    angle_rad = np.radians(-yaw_degrees)  # Inverse = negative angle
+
+    # Rotation around Y axis
+    R_y = np.array([
+        [ np.cos(angle_rad), 0, np.sin(angle_rad)],
+        [ 0,                1, 0               ],
+        [-np.sin(angle_rad), 0, np.cos(angle_rad)]
+    ])
+
+    # Separate XYZ and RGB
+    xyz = pc_rgb[:, :3]
+    rgb = pc_rgb[:, 3:]
+
+    # Rotate XYZ
+    xyz_rotated = (R_y @ xyz.T).T
+
+    # Recombine
+    rotated_pc_rgb = np.concatenate([xyz_rotated, rgb], axis=1)
+    return rotated_pc_rgb
 
 def rotate_inverse_yaw_pitch_roll(xyz, yaw_deg, pitch_deg, roll_deg):
     """
@@ -314,13 +365,13 @@ class UV360:
             aligned, R, T = self.align_point_cloud_svd_with_axis_swap(self.points3D) 
             self.data[image_id]["R_SVD"]=R
             self.data[image_id]["T_SVD"]=T
-            # file_name= os.path.splitext(image_data['file_name'])[0] + ".html"
-            # output_folder_depth=os.path.join(output_folder,"align")
-            # os.makedirs(output_folder_depth, exist_ok=True)
-            # output_folder_depth_path=os.path.join(output_folder_depth, file_name)
-            # self.plot_point_clouds(self.points3D, aligned, T,output_folder_depth_path) 
-            # # self.save_html(output_folder_depth_path, point_cloud_3D)
-            # print(f"Saved: {output_folder_depth_path}")
+            file_name= os.path.splitext(image_data['file_name'])[0] + ".html"
+            output_folder_depth=os.path.join(output_folder,"align")
+            os.makedirs(output_folder_depth, exist_ok=True)
+            output_folder_depth_path=os.path.join(output_folder_depth, file_name)
+            self.plot_point_clouds(self.points3D, aligned, T,output_folder_depth_path) 
+            # self.save_html(output_folder_depth_path, point_cloud_3D)
+            print(f"Saved: {output_folder_depth_path}")
     
     def read_points3D_bin_rgb(self):
         """
@@ -355,7 +406,41 @@ class UV360:
                     'track': track
                 }
         return points
-        
+    
+    def svd_align(self,xyz_src, xyz_tgt):
+        """
+        Align xyz_src to xyz_tgt using SVD (rigid transformation).
+        Returns: aligned_xyz, rotation_matrix, translation_vector
+        """
+        assert xyz_src.shape == xyz_tgt.shape
+
+        # Compute centroids
+        centroid_src = np.mean(xyz_src, axis=0)
+        centroid_tgt = np.mean(xyz_tgt, axis=0)
+
+        # Center the point clouds
+        src_centered = xyz_src - centroid_src
+        tgt_centered = xyz_tgt - centroid_tgt
+
+        # Compute covariance matrix
+        H = src_centered.T @ tgt_centered
+
+        # SVD
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+
+        # Handle reflection (ensure right-handed system)
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+
+        # Translation
+        t = centroid_tgt - R @ centroid_src
+
+        # Apply transform
+        xyz_src_aligned = (R @ xyz_src.T).T + t
+
+        return xyz_src_aligned, R, t    
     
     def _undistort_points_radial(self, xn, yn, k1):
         r2 = xn ** 2 + yn ** 2
@@ -426,6 +511,69 @@ class UV360:
                     }
         return camera_params
     
+    def icp_rgb(
+        self,
+        src_xyz, src_rgb,
+        tgt_xyz, tgt_rgb,
+        max_iterations=20,
+        tolerance=1e-5,
+        color_weight=0.3,
+        subsample_stride=10
+    ):
+        """
+        ICP with RGB-based matching and optional subsampling.
+        Returns:
+            aligned_src_xyz: full-resolution transformed source points
+            R_total: total rotation (3x3)
+            t_total: total translation (3,)
+        """
+        assert src_xyz.shape[0] == src_rgb.shape[0]
+        assert tgt_xyz.shape[0] == tgt_rgb.shape[0]
+
+        # Subsample for matching
+        src_xyz_sub = src_xyz[::subsample_stride]
+        src_rgb_sub = src_rgb[::subsample_stride]
+        tgt_xyz_sub = tgt_xyz[::subsample_stride]
+        tgt_rgb_sub = tgt_rgb[::subsample_stride]
+
+        src_xyz_curr = src_xyz_sub.copy()
+        prev_error = np.inf
+
+        # Global rotation and translation
+        R_total = np.eye(3)
+        t_total = np.zeros(3)
+
+        for i in range(max_iterations):
+            # Joint feature = XYZ + weighted RGB
+            src_feat = np.hstack([src_xyz_curr, src_rgb_sub * color_weight])
+            tgt_feat = np.hstack([tgt_xyz_sub, tgt_rgb_sub * color_weight])
+
+            tree = cKDTree(tgt_feat)
+            distances, indices = tree.query(src_feat)
+
+            matched_src = src_xyz_curr
+            matched_tgt = tgt_xyz_sub[indices]
+
+            # Estimate rigid transform
+            aligned_src, R, t = self.svd_align(matched_src, matched_tgt)
+
+            # Update source cloud
+            src_xyz_curr = aligned_src
+
+            # Accumulate global transform
+            R_total = R @ R_total
+            t_total = R @ t_total + t
+
+            # Convergence check
+            mean_error = np.mean(distances)
+            if np.abs(prev_error - mean_error) < tolerance:
+                break
+            prev_error = mean_error
+
+        # Apply total transform to full-resolution original src_xyz
+        aligned_src_xyz = (R_total @ src_xyz.T).T + t_total
+
+        return aligned_src_xyz, R_total, t_total
 
 
     def read_points3D_bin(self):
@@ -1538,12 +1686,16 @@ class UV360:
             name0 = os.path.join(self.xyz_rgb_path, os.path.splitext(data0['file_name'])[0] + ".ply")
             mesh0 = trimesh.load(name0)
             points0 = mesh0.vertices
+            rgb0 = mesh0.visual.vertex_colors[:, :3].astype(np.float32) / 255.0 
+            pc_rgb0 = np.concatenate([points0, rgb0], axis=1)
+            pc_rgb_subsampled0 = pc_rgb0[::100]
             R_SVD0=data0["R_SVD"]
             T_SVD0=data0["T_SVD"]
             ex0=data0["extrinsic"]
             xyz0=data0["sift_XYZ"]
             sift_match_pixels, sift_match_3D_ids=self.extarct_sift_matches(i0)
             yaw0, pitch, roll = extract_yaw_pitch_roll_custom(ex0)
+            yaw0 = compute_yaw_from_pointcloud(pc_rgb_subsampled0[:, :3])
             print("EX0:")
             print("Pitch:", pitch)
             print("Yaw:", yaw0)
@@ -1552,46 +1704,90 @@ class UV360:
             name1 = os.path.join(self.xyz_rgb_path, os.path.splitext(data1['file_name'])[0] + ".ply")
             mesh1 = trimesh.load(name1)
             points1 = mesh1.vertices
+            rgb1 = mesh1.visual.vertex_colors[:, :3].astype(np.float32) / 255.0 
+            pc_rgb1 = np.concatenate([points1, rgb1], axis=1)
+            pc_rgb_subsampled1 = pc_rgb1[::100]
             R_SVD1=data1["R_SVD"]
             T_SVD1=data1["T_SVD"]
             xyz1=data1["sift_XYZ"]
             ex1=data1["extrinsic"]
             yaw1, pitch, roll = extract_yaw_pitch_roll_custom(ex1)
+            yaw1 = compute_yaw_from_pointcloud(pc_rgb_subsampled1[:, :3])
             print("EX1:")
             print("Pitch:", pitch)
             print("Yaw:", yaw1)
             print("Roll:", roll)
-             
-            aligned0 = xyz0 - xyz0.mean(axis=0)
-            aligned1 = xyz1 - xyz1.mean(axis=0)
+            # ex0[:3, :3] = np.eye(3)
+            # ex1[:3, :3] = np.eye(3) 
+            # aligned0 = xyz0 - xyz0.mean(axis=0)
+            # aligned1 = xyz1 - xyz1.mean(axis=0)
+            ex0_inv = np.linalg.inv(ex0)  # camera 0 to world
+            ex1_inv = np.linalg.inv(ex1)  # camera 1 to world
+            xyz = pc_rgb_subsampled0[:, :3]
+            rgb = pc_rgb_subsampled0[:, 3:]
+            # xyz_centered = xyz - xyz.mean(axis=0)
+            ones = np.ones((xyz.shape[0], 1))
+            xyz_h = np.hstack([xyz, ones])
+            transformed_xyz_h = (ex0_inv @ xyz_h.T).T 
+            transformed_xyz = transformed_xyz_h[:, :3]
+            aligned0 = np.concatenate([transformed_xyz, rgb], axis=1)
             
+            xyz = pc_rgb_subsampled1[:, :3]
+            rgb = pc_rgb_subsampled1[:, 3:]
+            #xyz_centered = xyz - xyz.mean(axis=0)
+            #aligned1 = np.concatenate([xyz_centered, rgb], axis=1)
+            ones = np.ones((xyz.shape[0], 1))
+            xyz_h = np.hstack([xyz, ones])
+            transformed_xyz_h = (ex1_inv @ xyz_h.T).T 
+            transformed_xyz = transformed_xyz_h[:, :3]
+            aligned1 = np.concatenate([transformed_xyz, rgb], axis=1)
+        
+            aligned0 = aligned0 - aligned0.mean(axis=0)
+            aligned1 = aligned1 - aligned1.mean(axis=0)
             
-            aligned0_icp, R, t = self.run_icp_numpy(aligned0, aligned1)
+            #aligned0_icp, R, t = self.run_icp_numpy(aligned0, aligned1)
             
-            points1_align,R,T= self.transform_pc1_to_pc0(aligned1, ex0, ex1)
-            r = RR.from_matrix(R)
-            pitch, yaw, roll = r.as_euler('xyz', degrees=True)  # or use degrees=False for radians
+    #         # points1_align,R,T= self.transform_pc1_to_pc0(aligned1, ex0, ex1)
+    #         r = RR.from_matrix(R)
+    #         pitch, yaw, roll = r.as_euler('xyz', degrees=True)  # or use degrees=False for radians
 
-            yaw_rad = np.deg2rad(-90+yaw)  # convert degrees to radians
-            cos_y = np.cos(yaw_rad)
-            sin_y = np.sin(yaw_rad)
+    #         yaw_rad = np.deg2rad(-90+yaw)  # convert degrees to radians
+    #         cos_y = np.cos(yaw_rad)
+    #         sin_y = np.sin(yaw_rad)
             
-            # Rotation matrix for yaw (rotation about Y axis)
-            R_yaw = np.array([
-                [ cos_y, 0, sin_y],
-                [     0, 1,     0],
-                [-sin_y, 0, cos_y]
-    ])
-            xyz1_cam0=self.transform_pc_from_cam1_to_cam0(xyz1,ex0, ex1)
-            print("Pitch:", pitch)
-            print("Yaw:", yaw)
-            print("Roll:", roll)
-            xyz1_flipped = xyz1.copy()
-            xyz1_flipped[:, 0] *= -1
-            xyz1_flipped_icp, R, t = self.run_icp_numpy(xyz1_flipped, xyz0)
-            aligned0_rot = rotate_inverse_yaw(aligned0, -yaw0)  
-            aligned1_rot = rotate_inverse_yaw(aligned1, -yaw1)  
-            # points1_align = (R_yaw @ (aligned1.T)).T
+    #         # Rotation matrix for yaw (rotation about Y axis)
+    #         R_yaw = np.array([
+    #             [ cos_y, 0, sin_y],
+    #             [     0, 1,     0],
+    #             [-sin_y, 0, cos_y]
+    # ])
+    #        # xyz1_cam0=self.transform_pc_from_cam1_to_cam0(xyz1,ex0, ex1)
+    #         print("Pitch:", pitch)
+    #         print("Yaw:", yaw)
+    #         print("Roll:", roll)
+ #
+            # xyz1_flipped_icp, R, t = self.run_icp_numpy(xyz1_flipped, xyz0)
+            
+            aligned0_rot = rotate_inverse_yaw_RGB(aligned0, 0)  
+            aligned1_rot = rotate_inverse_yaw_RGB(aligned1, 50) 
+            
+            xyz0 = aligned0_rot[:, :3]
+            rgb0 = aligned0_rot[:, 3:] 
+            
+            xyz1 = aligned1_rot[:, :3]
+            rgb1 = aligned1_rot[:, 3:] 
+            
+            aligned_xyz1, R, t = self.icp_rgb(xyz0, rgb0, xyz1, rgb1, color_weight=0.05)
+            
+            # aligned0_rot = (R_SVD1 @ (aligned[0:3].T)).T
+            # aligned1_rot = (R_SVD1.T @ (aligned1[0:3].T)).T
+          # Rotate only XYZ
+            aligned0_rot_xyz = (R_SVD1 @ aligned0[:, :3].T).T
+            aligned1_rot_xyz = (R_SVD1.T @ aligned1[:, :3].T).T  # or R_SVD1.T for inverse
+
+            # Concatenate back with RGB
+            aligned0_rot = np.concatenate([aligned0_rot_xyz, aligned0[:, 3:]], axis=1)
+            aligned1_rot = np.concatenate([aligned1_rot_xyz, aligned1[:, 3:]], axis=1)
             
             # center = aligned1.mean(axis=0)        # shape (3,)
             # aligned1_centered = aligned1 - center
@@ -1610,13 +1806,13 @@ class UV360:
 
             dataf = [
                 go.Scatter3d(
-                    x=aligned0_rot[::N, 0], y=aligned0_rot[::N, 1], z=aligned0_rot[::N, 2],
+                    x=aligned0[::N, 0], y=aligned0[::N, 1], z=aligned0[::N, 2],
                     mode="markers",
                     marker=dict(size=1, color='blue'),
                     name="Aligned PC1"
                 ),
                 go.Scatter3d(
-                    x=aligned1_rot[::N, 0], y=aligned1_rot[::N, 1], z=aligned1_rot[::N, 2],
+                    x=aligned1[::N, 0], y=aligned1[::N, 1], z=aligned1[::N, 2],
                     mode="markers",
                     marker=dict(size=1, color='red', opacity=0.8),
                     name="Aligned PC0"
@@ -1626,9 +1822,10 @@ class UV360:
             layout = go.Layout(
                 title='Aligned Point Clouds (SVD)',
                 scene=dict(
-                    xaxis=dict(title='X'), yaxis=dict(title='Y'), zaxis=dict(title='Z')
+                    xaxis=dict(title='X', range=[-8, 8]),
+                    yaxis=dict(title='Y', range=[-8, 8]),
+                    zaxis=dict(title='Z', range=[-8, 8])
                 ),
-                margin=dict(r=10, l=10, b=10, t=10),
                 paper_bgcolor='rgb(30, 30, 30)',
                 font=dict(family="Courier New, monospace", color='rgb(200, 200, 200)'),
                 legend=dict(font=dict(family="Courier New, monospace", color='rgb(200, 200, 200)'))
