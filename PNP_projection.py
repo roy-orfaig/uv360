@@ -9,6 +9,65 @@ import plotly.graph_objects as go
 selected_points = []
 scale_factor = 0.5  # Display image at 50% size
 
+def PNP_projection(points_CAD,points_image,K,pcd_path):
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+
+    # Run solvePnP
+    success, rvec, tvec = cv2.solvePnP(points_CAD, points_image, K, dist_coeffs)
+
+    # Convert rotation vector to matrix
+    R, _ = cv2.Rodrigues(rvec)
+    extrinsic = np.hstack((R, tvec))
+
+    # print("Rotation matrix:\n", R)
+    # print("Translation vector:\n", tvec)
+    print("Extrinsic matrix:\n", extrinsic)
+
+    pcd = o3d.io.read_point_cloud(pcd_path)
+
+    # Convert to numpy array
+    points = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors) if pcd.has_colors() else None
+
+    # Downsample (optional, for speed)
+    sampled = points[::10]
+    sampled_colors = colors[::10] if colors is not None else None
+
+    # Create scatter plot
+    fig = go.Figure(data=[go.Scatter3d(
+        x=sampled[:, 0],
+        y=sampled[:, 1],
+        z=sampled[:, 2],
+        mode='markers',
+        marker=dict(
+            size=1,
+            color=sampled_colors if sampled_colors is not None else 'gray',
+            opacity=0.8
+        )
+    )])
+
+    # Set layout
+    fig.update_layout(
+        scene=dict(
+            xaxis_title='X',
+            yaxis_title='Y',
+            zaxis_title='Z'
+        ),
+        title="3D Point Cloud",
+        margin=dict(l=0, r=0, b=0, t=30)
+    )
+
+    # Show plot
+    #fig.show()
+    #fig.write_html("pointcloud_plot.html")
+
+    sampled = points.astype(np.float64)  # ensure correct type
+
+    # Project using OpenCV
+    projected_points, _ = cv2.projectPoints(sampled, rvec, tvec, K, dist_coeffs)
+    projected_points = projected_points.squeeze()  # shape (N, 2)
+    return projected_points
+
 def onclick(event):
     if event.xdata is not None and event.ydata is not None:
         x_disp, y_disp = event.xdata, event.ydata
@@ -41,7 +100,9 @@ def select_points_from_image(image_path):
     return selected_points
 
 # Example usage
+pcd_path="/home/roy.o@uveye.local/projects/uv360/cad_example/gmc_yukon_pointcloud2.ply"
 image_path = "/home/roy.o@uveye.local/projects/uv360/frames4_extracted/frame_0005.png"
+image_path = "/home/roy.o@uveye.local/projects/uv360/cad_example/0418a0f0-954f-4830-b685-f3b97591027d/frames_front_00/frame_0005.png"
 # points = select_points_from_image(image_path)
 # print("Selected points:", points)
 points = np.array([
@@ -63,27 +124,27 @@ K = np.array([
 ], dtype=np.float64)  # important!
 
 # Convert points to float64 explicitly to avoid type mismatch
-points_image = np.array([
-    [ 608,  473],
-    [1094,  468],
-    [ 632,  674],
-    [1288,  641],
-    [1194,  919],
-    [1690,  834],
-    [1270, 1158],
-    [1659, 1051]
-], dtype=np.float64)
+# points_image = np.array([
+#     [ 608,  473],
+#     [1094,  468],
+#     [ 632,  674],
+#     [1288,  641],
+#     [1194,  919],
+#     [1690,  834],
+#     [1270, 1158],
+#     [1659, 1051]
+# ], dtype=np.float64)
 
-# points = np.array([
-#     [ 610,  469],
-#     [1094,  467],
-#     [ 634,  673],
-#     [1285,  639],
-#     [1193,  916],
-#     [1683,  830],
-#     [1658, 1052],
-#     [1272, 1156]
-# ])
+points_image = np.array([
+    [ 610,  469],
+    [1094,  467],
+    [ 634,  673],
+    [1285,  639],
+    [1193,  916],
+    [1683,  830],
+    [1272, 1156],
+    [1658, 1052],
+], dtype=np.float64)
 
 
 points_CAD = np.array([
@@ -97,62 +158,8 @@ points_CAD = np.array([
     [ 50.252354, -256.600,  76.737900]
 ], dtype=np.float64)
 # Distortion coefficients (assumed zero for now)
-dist_coeffs = np.zeros((4, 1), dtype=np.float64)
 
-# Run solvePnP
-success, rvec, tvec = cv2.solvePnP(points_CAD, points_image, K, dist_coeffs)
-
-# Convert rotation vector to matrix
-R, _ = cv2.Rodrigues(rvec)
-extrinsic = np.hstack((R, tvec))
-
-# print("Rotation matrix:\n", R)
-# print("Translation vector:\n", tvec)
-print("Extrinsic matrix:\n", extrinsic)
-
-pcd = o3d.io.read_point_cloud("/home/roy.o@uveye.local/projects/uv360/cad_example/gmc_yukon_pointcloud2.ply")
-
-# Convert to numpy array
-points = np.asarray(pcd.points)
-colors = np.asarray(pcd.colors) if pcd.has_colors() else None
-
-# Downsample (optional, for speed)
-sampled = points[::10]
-sampled_colors = colors[::10] if colors is not None else None
-
-# Create scatter plot
-fig = go.Figure(data=[go.Scatter3d(
-    x=sampled[:, 0],
-    y=sampled[:, 1],
-    z=sampled[:, 2],
-    mode='markers',
-    marker=dict(
-        size=1,
-        color=sampled_colors if sampled_colors is not None else 'gray',
-        opacity=0.8
-    )
-)])
-
-# Set layout
-fig.update_layout(
-    scene=dict(
-        xaxis_title='X',
-        yaxis_title='Y',
-        zaxis_title='Z'
-    ),
-    title="3D Point Cloud",
-    margin=dict(l=0, r=0, b=0, t=30)
-)
-
-# Show plot
-#fig.show()
-fig.write_html("pointcloud_plot.html")
-
-sampled = points.astype(np.float64)  # ensure correct type
-
-# Project using OpenCV
-projected_points, _ = cv2.projectPoints(sampled, rvec, tvec, K, dist_coeffs)
-projected_points = projected_points.squeeze()  # shape (N, 2)
+projected_points=PNP_projection(points_CAD,points_image,K,pcd_path)
 
 # Load original image
 image = cv2.imread(image_path)
@@ -166,6 +173,114 @@ for (u, v) in projected_points:
         cv2.circle(image, (u, v), radius=1, color=(0, 255, 255), thickness=1)  # red dot
 
 # Save the new image
-output_path = "/home/roy.o@uveye.local/projects/uv360/projected_overlay_frame_0005.png"
+output_path = "/home/roy.o@uveye.local/projects/uv360/projected_overlay_frame_0005_LEFT.png"
+cv2.imwrite(output_path, image)
+print(f"Saved image with projected points to:\n{output_path}")
+
+############ LEFT ******************
+image_path = "/home/roy.o@uveye.local/projects/uv360/cad_example/0418a0f0-954f-4830-b685-f3b97591027d/frames_front_01/frame_0005.png"
+
+points_image_right = np.array([
+    [ 975,  569],
+    [1482,  571],
+    [ 796,  743],
+    [1424,  796],
+    [ 447,  965],
+    [1030, 1045],
+    [ 474, 1193],
+    [ 956, 1305]
+], dtype=np.float64)
+
+projected_points=PNP_projection(points_CAD,points_image_right,K,pcd_path)
+
+# Load original image
+image = cv2.imread(image_path)
+if image is None:
+    raise ValueError("Image not found at path:", image_path)
+
+# Overlay projected points
+for (u, v) in projected_points:
+    u, v = int(round(u)), int(round(v))
+    if 0 <= u < image.shape[1] and 0 <= v < image.shape[0]:
+        cv2.circle(image, (u, v), radius=1, color=(0, 255, 255), thickness=1)  # red dot
+
+# Save the new image
+output_path = "/home/roy.o@uveye.local/projects/uv360/projected_overlay_frame_000_RIGHT.png"
+cv2.imwrite(output_path, image)
+print(f"Saved image with projected points to:\n{output_path}")
+
+
+############ Back_rear_00 ******************
+image_path = "/home/roy.o@uveye.local/projects/uv360/cad_example/0418a0f0-954f-4830-b685-f3b97591027d/frames_front_01/frame_0005.png"
+
+points_CAD_back = np.array([
+    [-70.661,    -53.862, 179.842],
+    [ 70.221611, -53.367, 180.200],
+    [-80.819,   -133.810, 139.835],
+    [ 77.962059, -128.730, 138.603],
+    [-54.956,   -249.470, 117.820],
+    [ 56.013645, -250.750, 118.647],
+    [-50.914,   -257.360,  76.466743],
+    [ 50.252354, -256.600,  76.737900]
+], dtype=np.float64)
+
+points_image_rear_00 = np.array([
+    [ 975,  569],
+    [1482,  571],
+    [ 796,  743],
+    [1424,  796],
+    [ 447,  965],
+    [1030, 1045],
+    [ 474, 1193],
+    [ 956, 1305]
+], dtype=np.float64)
+
+projected_points=PNP_projection(points_CAD,points_image_right,K,pcd_path)
+
+# Load original image
+image = cv2.imread(image_path)
+if image is None:
+    raise ValueError("Image not found at path:", image_path)
+
+# Overlay projected points
+for (u, v) in projected_points:
+    u, v = int(round(u)), int(round(v))
+    if 0 <= u < image.shape[1] and 0 <= v < image.shape[0]:
+        cv2.circle(image, (u, v), radius=1, color=(0, 255, 255), thickness=1)  # red dot
+
+# Save the new image
+output_path = "/home/roy.o@uveye.local/projects/uv360/projected_overlay_frame_000_RIGHT.png"
+cv2.imwrite(output_path, image)
+print(f"Saved image with projected points to:\n{output_path}")
+
+
+############ Back_rear_01 ******************
+
+points_image_rear_01 = np.array([
+    [ 975,  569],
+    [1482,  571],
+    [ 796,  743],
+    [1424,  796],
+    [ 447,  965],
+    [1030, 1045],
+    [ 474, 1193],
+    [ 956, 1305]
+], dtype=np.float64)
+
+projected_points=PNP_projection(points_CAD,points_image_right,K,pcd_path)
+
+# Load original image
+image = cv2.imread(image_path)
+if image is None:
+    raise ValueError("Image not found at path:", image_path)
+
+# Overlay projected points
+for (u, v) in projected_points:
+    u, v = int(round(u)), int(round(v))
+    if 0 <= u < image.shape[1] and 0 <= v < image.shape[0]:
+        cv2.circle(image, (u, v), radius=1, color=(0, 255, 255), thickness=1)  # red dot
+
+# Save the new image
+output_path = "/home/roy.o@uveye.local/projects/uv360/projected_overlay_frame_000_RIGHT.png"
 cv2.imwrite(output_path, image)
 print(f"Saved image with projected points to:\n{output_path}")

@@ -41,6 +41,6 @@ def select_points_from_image(image_path):
     return selected_points
 
 # Example usage
-image_path = "/home/roy.o@uveye.local/projects/uv360/cad_example/0418a0f0-954f-4830-b685-f3b97591027d/frames_front_00/frame_0005.png"
+image_path = "/home/roy.o@uveye.local/projects/uv360/cad_example/0418a0f0-954f-4830-b685-f3b97591027d/frames_front_01/frame_0005.png"
 points = select_points_from_image(image_path)
 print("Selected points:", points)
